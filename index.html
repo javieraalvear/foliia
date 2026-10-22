@@ -19,6 +19,7 @@
     --dot-error: #ef4444;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   html, body {
     margin: 0; height: 100%; overflow: hidden;
     background: #000; color: #fff;
@@ -130,6 +131,10 @@
     background: #fff; color: #000; cursor: pointer;
   }
   #startBtn:disabled { opacity: .4; cursor: default; }
+  #startEngine {
+    background: transparent; color: #9a9a9a; border: 1px solid #333; border-radius: 999px;
+    padding: 6px 12px; font: 13px system-ui, sans-serif; cursor: pointer;
+  }
   #progress { width: min(320px, 70vw); height: 4px; border-radius: 2px; background: #2a2a2a; overflow: hidden; }
   #progressFill { height: 100%; width: 0; background: #fff; transition: width .2s; }
   #startMsg { min-height: 1.4em; font-size: 13px; color: #9a9a9a; text-align: center; max-width: 80vw; line-height: 1.5; }
@@ -192,6 +197,10 @@
 <!-- Pantalla inicial: botón + progreso de carga del modelo -->
 <div id="start">
   <button id="startBtn" type="button">Iniciar</button>
+  <select id="startEngine" aria-label="Motor de transcripción">
+    <option value="local">Local · Whisper en tu Mac</option>
+    <option value="realtime">OpenAI Realtime · nube</option>
+  </select>
   <div id="progress"><div id="progressFill"></div></div>
   <div id="startMsg"></div>
 </div>
@@ -200,7 +209,14 @@
 <div id="panel" aria-label="Controles">
   <label><div class="lbl">Cámara</div><select id="selCam"></select></label>
   <label><div class="lbl">Micrófono</div><select id="selMic"></select></label>
-  <label><div class="lbl">Modelo <span class="device" id="deviceInfo"></span></div>
+  <label><div class="lbl">Motor</div>
+    <select id="selEngine">
+      <option value="local">Local (Whisper en tu Mac, offline)</option>
+      <option value="realtime">OpenAI Realtime (nube, de pago)</option>
+    </select>
+    <div class="device" id="costInfo" hidden></div>
+  </label>
+  <label id="modelRow"><div class="lbl">Modelo <span class="device" id="deviceInfo"></span></div>
     <select id="selModel">
       <option value="base">whisper-base (rápido)</option>
       <option value="small">whisper-small (mejor español, más lento)</option>
@@ -232,6 +248,8 @@
 //  index.html — UI, cámara, captura de audio, VAD/segmentación y subtítulos.
 // =============================================================================
 
+import { RealtimeTranscriber } from './realtime.js';
+
 const $ = (id) => document.getElementById(id);
 
 // -----------------------------------------------------------------------------
@@ -252,7 +270,7 @@ const PANEL_HIDE_MS = 3000;
 // -----------------------------------------------------------------------------
 // 2. PREFERENCIAS (localStorage, siempre envuelto en try/catch)
 // -----------------------------------------------------------------------------
-const DEFAULT_PREFS = { cameraId: '', micId: '', model: 'base', mirror: true, scale: 1, style: 'box', vad: 60 };
+const DEFAULT_PREFS = { cameraId: '', micId: '', engine: 'local', model: 'base', mirror: true, scale: 1, style: 'box', vad: 60 };
 const prefs = (() => {
   try { return { ...DEFAULT_PREFS, ...JSON.parse(localStorage.getItem('subtitulos.prefs') || '{}') }; }
   catch { return { ...DEFAULT_PREFS }; }
@@ -268,19 +286,30 @@ const state = {
   started: false,
   paused: false,
   modelReady: false,
+  modelLoading: false,
   device: null,
   workerBusy: false,
   finalQueue: [],       // los finales nunca se descartan; los interinos sí
   nextReqId: 1,
   error: false,
+  realtimeAvailable: false,  // hay OPENAI_API_KEY en .env (lo dice serve.py)
+  rtStatus: 'closed',        // connecting | open | closed | error
 };
+const isRealtime = () => prefs.engine === 'realtime';
+// ¿Se puede procesar audio? (el modo realtime conecta bajo demanda y encola mientras tanto)
+const engineReady = () => (isRealtime() ? true : state.modelReady);
 
 // -----------------------------------------------------------------------------
 // 4. INDICADOR DE ESTADO + AVISOS
 // -----------------------------------------------------------------------------
 function updateStatus() {
   let s = 'loading';
-  if (state.error) s = 'error';
+  if (isRealtime()) {
+    if (state.rtStatus === 'error') s = 'error';
+    else if (state.paused || state.rtStatus === 'connecting') s = 'loading';
+    else if (rtItems.size) s = 'busy';
+    else s = 'listening';
+  } else if (state.error) s = 'error';
   else if (!state.modelReady || state.paused) s = 'loading';
   else if (state.workerBusy) s = 'busy';
   else s = 'listening';
@@ -325,21 +354,22 @@ worker.addEventListener('message', (e) => {
   switch (msg.type) {
     case 'progress':
       setProgress(msg.progress);
-      if (!state.started) $('startMsg').textContent = `Cargando modelo… ${Math.round(msg.progress)} %`;
+      if (!state.started && !isRealtime()) $('startMsg').textContent = `Cargando modelo… ${Math.round(msg.progress)} %`;
       break;
 
     case 'warming':
-      if (!state.started) $('startMsg').textContent = 'Preparando la GPU (solo tarda la primera vez)…';
+      if (!state.started && !isRealtime()) $('startMsg').textContent = 'Preparando la GPU (solo tarda la primera vez)…';
       break;
 
     case 'ready':
       state.modelReady = true;
+      state.modelLoading = false;
       state.device = msg.device;
       state.error = false;
       setProgress(100);
       $('topbar').classList.remove('on');
       $('deviceInfo').textContent = msg.device === 'webgpu' ? 'WebGPU' : 'WASM (sin GPU)';
-      if (!state.started) {
+      if (!state.started && !isRealtime()) {
         $('startMsg').classList.remove('error');
         $('startMsg').textContent = msg.device === 'webgpu' ? '' : 'WebGPU no disponible: usando CPU (más lento).';
       }
@@ -358,6 +388,7 @@ worker.addEventListener('message', (e) => {
 
 function loadModel(model) {
   state.modelReady = false;
+  state.modelLoading = true;
   state.workerBusy = false;
   state.finalQueue.length = 0;
   setProgress(0);
@@ -367,6 +398,7 @@ function loadModel(model) {
 }
 
 function handleWorkerError(msg) {
+  if (!msg.id) state.modelLoading = false;
   if (msg.code === 'MODEL_NOT_FOUND') {
     if (prefs.model !== 'base') {
       console.warn(`[app] whisper-${prefs.model} no está en /models; volviendo a whisper-base.`);
@@ -514,7 +546,7 @@ function clearCaptions() {
 setInterval(() => {
   if (!state.started) return;
   const idle = performance.now() - lastActivity > FADE_AFTER_MS;
-  if (idle && !seg.active && !state.workerBusy && !state.finalQueue.length) {
+  if (idle && !seg.active && !state.workerBusy && !state.finalQueue.length && !rtItems.size) {
     const c = $('captions');
     if (!c.classList.contains('faded')) {
       c.classList.add('faded');
@@ -559,6 +591,93 @@ function onResult(msg) {
 }
 
 // -----------------------------------------------------------------------------
+// 8b. MOTOR OPENAI REALTIME
+// -----------------------------------------------------------------------------
+// Frases en curso por item_id (orden de llegada). Las finales se muestran en
+// orden aunque OpenAI no garantice el orden de las respuestas.
+const rtItems = new Map(); // item_id -> { text, final, done, t }
+
+const rt = new RealtimeTranscriber({
+  onStatus: (s) => { state.rtStatus = s; updateStatus(); },
+  onError: (m) => { console.error('[realtime]', m); toast(m, 8000); },
+  onDelta: (id, delta) => {
+    const it = rtItem(id);
+    it.text += delta;
+    it.t = performance.now();
+    renderRealtime();
+  },
+  onCompleted: (id, transcript, usage) => {
+    const it = rtItem(id);
+    it.done = true;
+    it.final = transcript;
+    console.log(`[realtime] final «${transcript}»` + (usage?.seconds ? ` (${usage.seconds} s facturados)` : ''));
+    flushRealtimeFinals();
+    renderRealtime();
+  },
+});
+
+function rtItem(id) {
+  let it = rtItems.get(id);
+  if (!it) { it = { text: '', final: '', done: false, t: performance.now() }; rtItems.set(id, it); }
+  return it;
+}
+
+function flushRealtimeFinals() {
+  for (const [id, it] of rtItems) {
+    if (!it.done) {
+      if (performance.now() - it.t > 8000) { rtItems.delete(id); continue; } // nunca llegó su final
+      break;
+    }
+    rtItems.delete(id);
+    const text = cleanText(it.final);
+    if (isHallucination(text, 99)) {
+      if (it.final) console.log(`[filtro] descartado: «${it.final}»`);
+      continue;
+    }
+    pushFinal(text);
+  }
+}
+
+function renderRealtime() {
+  captions.interim = [...rtItems.values()].map((i) => (i.done ? i.final : i.text)).join(' ').trim();
+  renderCaptions();
+  updateStatus();
+}
+
+// Costo estimado en el panel (OpenAI cobra por segundos de audio enviados)
+setInterval(() => {
+  if (!isRealtime()) return;
+  $('costInfo').textContent =
+    `Enviado a OpenAI: ${(rt.secondsSent / 60).toFixed(1)} min · ≈ US$ ${rt.costUSD.toFixed(3)}`;
+}, 1000);
+
+function setEngine(engine) {
+  if (engine === 'realtime' && !state.realtimeAvailable) {
+    const msg = 'Para usar OpenAI, pon tu OPENAI_API_KEY en el archivo .env y reinicia python3 serve.py.';
+    if (state.started) toast(msg, 9000);
+    else { $('startMsg').textContent = msg; $('startMsg').classList.add('error'); }
+    applyPrefs();  // devuelve los selectores al motor actual
+    return false;
+  }
+  prefs.engine = engine;
+  savePrefs();
+  // Abandonar la frase en curso del motor anterior
+  if (seg.active && engine === 'local') rt.clear();
+  seg.active = false; seg.frames = []; seg.length = 0; preRoll.length = 0;
+  captions.interim = ''; rtItems.clear(); renderCaptions();
+
+  if (engine === 'realtime') {
+    if (state.started) rt.connect().catch(() => {});
+  } else {
+    rt.close();
+    if (!state.modelReady && !state.modelLoading) loadModel(prefs.model);
+  }
+  applyPrefs();
+  updateStatus();
+  return true;
+}
+
+// -----------------------------------------------------------------------------
 // 9. VAD + SEGMENTACIÓN (simulación de tiempo real)
 // -----------------------------------------------------------------------------
 // Umbral RMS a partir de la sensibilidad 0–100 (escala logarítmica):
@@ -590,10 +709,18 @@ function openSegment() {
   seg.silenceMs = 0;
   seg.startedAt = performance.now();
   seg.lastInterimAt = seg.startedAt;
+  seg.held = [];
+  if (isRealtime()) for (const f of seg.frames) rt.append(f);
 }
 
 function closeSegment(reason) {
   seg.active = false;
+  if (isRealtime()) {
+    // El silencio retenido (seg.held) nunca se envía: no se paga
+    if (seg.voiced < MIN_VOICED_FRAMES) rt.clear(); else rt.commit();
+    seg.frames = []; seg.length = 0; seg.held = [];
+    return;
+  }
   // Recorta el silencio final, dejando un pequeño margen
   const silentFrames = Math.floor(seg.silenceMs / FRAME_MS);
   const drop = Math.max(0, silentFrames - KEEP_TAIL_SILENCE_FRAMES);
@@ -613,7 +740,7 @@ function closeSegment(reason) {
 
 function onAudioFrame(samples, rms) {
   updateMeter(rms);
-  if (state.paused || !state.modelReady) return;
+  if (state.paused || !engineReady()) return;
 
   const voiced = rms > vadThreshold();
   if (voiced) lastActivity = performance.now();
@@ -639,6 +766,21 @@ function onAudioFrame(samples, rms) {
   const now = performance.now();
   const durMs = (seg.length / SR) * 1000;
 
+  if (isRealtime()) {
+    // Streaming a OpenAI: la voz sale al instante; el silencio se envía solo
+    // hasta ~200 ms y el resto se retiene (se suelta si la persona sigue hablando)
+    if (voiced) {
+      for (const f of seg.held) rt.append(f);
+      seg.held = [];
+      rt.append(samples);
+    } else if (seg.silenceMs <= KEEP_TAIL_SILENCE_FRAMES * FRAME_MS) {
+      rt.append(samples);
+    } else {
+      seg.held.push(samples);
+    }
+    seg.frames.length = 0; seg.frames.push(samples);  // en este modo no hace falta acumular
+  }
+
   if (seg.silenceMs >= SILENCE_TO_FINAL_MS) { closeSegment('silencio'); return; }
   if (durMs >= MAX_SEGMENT_MS) {
     console.log('[vad] segmento > 15 s: cierre forzado');
@@ -648,7 +790,7 @@ function onAudioFrame(samples, rms) {
   }
 
   // Interino cada ~1 s, solo si el worker está libre (nunca se encola)
-  if (now - seg.lastInterimAt >= INTERIM_EVERY_MS && seg.voiced >= MIN_VOICED_FRAMES) {
+  if (!isRealtime() && now - seg.lastInterimAt >= INTERIM_EVERY_MS && seg.voiced >= MIN_VOICED_FRAMES) {
     seg.lastInterimAt = now;
     if (!state.workerBusy && !state.finalQueue.length) {
       sendToWorker('interim', seg.id, concatFrames(seg.frames, seg.length));
@@ -691,33 +833,34 @@ function mediaErrorMessage(err, what) {
   }
 }
 
-async function startCamera(deviceId) {
-  videoStream?.getTracks().forEach((t) => t.stop());
-  const video = deviceId
-    ? { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 } }
-    : { width: { ideal: 1920 }, height: { ideal: 1080 } };
-  try {
-    videoStream = await navigator.mediaDevices.getUserMedia({ video });
-  } catch (err) {
-    if (deviceId && err.name === 'OverconstrainedError') return startCamera('');  // cámara guardada ya no existe
-    throw Object.assign(err, { what: 'cámara' });
-  }
-  $('cam').srcObject = videoStream;
+const videoConstraints = (id) => ({
+  width: { ideal: 1920 }, height: { ideal: 1080 },
+  ...(id ? { deviceId: { exact: id } } : {}),
+});
+const audioConstraints = (id) => ({
+  echoCancellation: true, noiseSuppression: true, channelCount: 1,
+  ...(id ? { deviceId: { exact: id } } : {}),
+});
+
+// Crea el AudioContext de forma síncrona dentro del gesto del usuario
+// (Safari solo deja arrancar el audio si se crea/reanuda durante el clic).
+function ensureAudioContext() {
+  if (audioCtx) return;
+  audioCtx = new AudioContext({ latencyHint: 'interactive' });
+  audioCtx.resume();
 }
 
-async function startMic(deviceId) {
-  audioStream?.getTracks().forEach((t) => t.stop());
-  const audio = { echoCancellation: true, noiseSuppression: true, channelCount: 1 };
-  if (deviceId) audio.deviceId = { exact: deviceId };
-  try {
-    audioStream = await navigator.mediaDevices.getUserMedia({ audio });
-  } catch (err) {
-    if (deviceId && err.name === 'OverconstrainedError') return startMic('');
-    throw Object.assign(err, { what: 'micrófono' });
-  }
+function attachVideo(stream) {
+  videoStream?.getTracks().forEach((t) => t.stop());
+  videoStream = stream;
+  $('cam').srcObject = stream;
+}
 
-  if (!audioCtx) {
-    audioCtx = new AudioContext({ latencyHint: 'interactive' });
+async function attachAudio(stream) {
+  audioStream?.getTracks().forEach((t) => t.stop());
+  audioStream = stream;
+  ensureAudioContext();
+  if (!workletNode) {
     await audioCtx.audioWorklet.addModule('./audio-processor.js');
     workletNode = new AudioWorkletNode(audioCtx, 'resampler-processor', {
       numberOfInputs: 1, numberOfOutputs: 1, channelCount: 1, channelCountMode: 'explicit',
@@ -729,9 +872,33 @@ async function startMic(deviceId) {
     workletNode.connect(mute).connect(audioCtx.destination);
   }
   sourceNode?.disconnect();
-  sourceNode = audioCtx.createMediaStreamSource(audioStream);
+  sourceNode = audioCtx.createMediaStreamSource(stream);
   sourceNode.connect(workletNode);
   if (audioCtx.state === 'suspended') await audioCtx.resume();
+}
+
+// Arranque: cámara + micrófono en UNA sola petición → un único aviso de permisos
+async function startMedia(cameraId, micId) {
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: videoConstraints(cameraId), audio: audioConstraints(micId),
+    });
+  } catch (err) {
+    // Los dispositivos guardados ya no existen: reintentar con los predeterminados
+    if ((cameraId || micId) && err.name === 'OverconstrainedError') return startMedia('', '');
+    throw Object.assign(err, { what: 'cámara/micrófono' });
+  }
+  attachVideo(new MediaStream(stream.getVideoTracks()));
+  await attachAudio(new MediaStream(stream.getAudioTracks()));
+}
+
+// Cambio de dispositivo desde el panel
+async function startCamera(deviceId) {
+  attachVideo(await navigator.mediaDevices.getUserMedia({ video: videoConstraints(deviceId) }));
+}
+async function startMic(deviceId) {
+  await attachAudio(await navigator.mediaDevices.getUserMedia({ audio: audioConstraints(deviceId) }));
 }
 
 async function populateDevices() {
@@ -773,6 +940,10 @@ function hidePanel() {
 document.addEventListener('mousemove', showPanel);
 
 function applyPrefs() {
+  $('selEngine').value = prefs.engine;
+  $('startEngine').value = prefs.engine;
+  $('modelRow').hidden = isRealtime();
+  $('costInfo').hidden = !isRealtime();
   $('cam').classList.toggle('mirror', prefs.mirror);
   $('btnMirror').classList.toggle('on', prefs.mirror);
   document.documentElement.style.setProperty('--cap-scale', prefs.scale);
@@ -794,6 +965,7 @@ function togglePause() {
   state.paused = !state.paused;
   if (state.paused) {
     // Abandonar el segmento en curso sin transcribir
+    if (seg.active && isRealtime()) rt.clear();
     seg.active = false; seg.frames = []; seg.length = 0; preRoll.length = 0;
     captions.interim = ''; renderCaptions();
   }
@@ -809,6 +981,8 @@ $('selMic').addEventListener('change', async (e) => {
   try { await startMic(e.target.value); prefs.micId = e.target.value; savePrefs(); }
   catch (err) { toast(mediaErrorMessage(err, 'micrófono')); }
 });
+$('selEngine').addEventListener('change', (e) => setEngine(e.target.value));
+$('startEngine').addEventListener('change', (e) => { if (setEngine(e.target.value)) showEngineMsg(); });
 $('selModel').addEventListener('change', (e) => { prefs.model = e.target.value; savePrefs(); loadModel(prefs.model); });
 $('selStyle').addEventListener('change', (e) => { prefs.style = e.target.value; savePrefs(); applyPrefs(); });
 $('rngSize').addEventListener('input', (e) => setScale(+e.target.value));
@@ -827,8 +1001,12 @@ document.addEventListener('keydown', (e) => {
   const handled = () => { e.preventDefault(); e.target.blur?.(); };
   if (k === 'f' || k === 'F') {
     handled();
-    if (document.fullscreenElement) document.exitFullscreen();
-    else document.documentElement.requestFullscreen().catch(() => {});
+    const el = document.documentElement;
+    if (document.fullscreenElement || document.webkitFullscreenElement) {
+      (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+    } else {
+      Promise.resolve((el.requestFullscreen || el.webkitRequestFullscreen).call(el)).catch(() => {});
+    }
   } else if (k === 'm' || k === 'M') { handled(); toggleMirror(); }
   else if (k === ' ') { handled(); togglePause(); }
   else if (k === 'c' || k === 'C') { handled(); clearCaptions(); }
@@ -846,9 +1024,9 @@ document.addEventListener('keydown', (e) => {
 // -----------------------------------------------------------------------------
 async function start() {
   $('startBtn').disabled = true;
+  ensureAudioContext();  // síncrono, dentro del gesto (requisito de Safari)
   try {
-    await startCamera(prefs.cameraId);
-    await startMic(prefs.micId);
+    await startMedia(prefs.cameraId, prefs.micId);
   } catch (err) {
     $('startBtn').disabled = false;
     fatal(mediaErrorMessage(err, err.what || 'cámara/micrófono'));
@@ -858,27 +1036,59 @@ async function start() {
   state.started = true;
   $('start').classList.add('hidden');
   document.body.classList.add('idle');
-  if (!state.modelReady && !state.error) $('topbar').classList.add('on');  // el modelo aún carga
+  if (isRealtime()) rt.connect().catch(() => {});   // conectar ya: la primera frase no espera
+  else if (!state.modelReady && !state.error) $('topbar').classList.add('on');  // el modelo aún carga
   updateStatus();
+}
+
+function showEngineMsg() {
+  if (state.started) return;
+  $('startMsg').classList.remove('error');
+  if (isRealtime()) {
+    $('startMsg').textContent = 'Transcripción con OpenAI: requiere internet y el audio con voz se envía a la nube.';
+    setProgress(100);
+  } else if (!state.modelReady) {
+    $('startMsg').textContent = 'Cargando modelo…';
+  } else {
+    $('startMsg').textContent = '';
+  }
 }
 
 // Comprobaciones de entorno
 (function boot() {
   applyPrefs();
   if (location.protocol === 'file:') {
-    fatal('Abre la app desde un servidor local: python3 -m http.server 8000 → http://localhost:8000');
+    fatal('Abre la app desde el servidor local: python3 serve.py → http://localhost:8000');
     $('startBtn').disabled = true;
     return;
   }
   if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
-    fatal('La cámara/micrófono requieren http://localhost o https. Abre http://localhost:8000');
+    fatal('La cámara y el micrófono requieren http://localhost. Abre http://localhost:8000');
     $('startBtn').disabled = true;
     return;
   }
   if (!('gpu' in navigator)) console.warn('[app] WebGPU no disponible: la transcripción usará WASM (más lenta).');
-  $('startMsg').textContent = 'Cargando modelo…';
-  loadModel(prefs.model);  // la carga empieza ya; "Iniciar" puede pulsarse en paralelo
   $('startBtn').addEventListener('click', start);
+
+  // ¿Está configurada la clave de OpenAI? (serve.py lo informa; con http.server no hay API)
+  fetch('/api/config').then((r) => (r.ok ? r.json() : {})).catch(() => ({})).then((cfg) => {
+    state.realtimeAvailable = !!cfg.realtime;
+    if (!state.realtimeAvailable) {
+      for (const sel of [$('selEngine'), $('startEngine')]) {
+        sel.querySelector('option[value=realtime]').textContent += ' (falta clave en .env)';
+      }
+      if (isRealtime()) {
+        console.warn('[app] Sin OPENAI_API_KEY en .env: usando el motor local.');
+        prefs.engine = 'local';
+        savePrefs();
+      }
+    }
+    applyPrefs();
+    showEngineMsg();
+    // El modelo local solo se carga si se va a usar (ahorra memoria de GPU)
+    if (!isRealtime()) loadModel(prefs.model);
+    updateStatus();
+  });
 })();
 </script>
 </body>

@@ -32,11 +32,27 @@ const MODELS = {
   small: 'onnx-community/whisper-small',
 };
 
-// dtype por archivo ONNX según backend (ver download-models.sh)
-const DTYPES = {
-  webgpu: { encoder_model: 'fp32', decoder_model_merged: 'q4' },
-  wasm: { encoder_model: 'q8', decoder_model_merged: 'q4' },
+// Configuración por backend (ver download-models.sh). Medido en Safari 26 / M-series:
+//  - 'gpu': encoder en WebGPU fp16 (un único pase pesado de 30 s de audio → ideal
+//    para la GPU) + decoder en WASM q8 multihilo (muchos pasos pequeños, uno por
+//    token → en WebGPU domina el costo fijo de cada despacho). Frase de 5,8 s:
+//    879 ms, contra 1910 ms con todo en WebGPU (encoder fp32 + decoder q4).
+//  - 'wasm': todo en CPU q8 (fallback sin WebGPU o sin shader-f16).
+const CONFIGS = {
+  gpu: {
+    device: { encoder_model: 'webgpu', decoder_model_merged: 'wasm' },
+    dtype: { encoder_model: 'fp16', decoder_model_merged: 'q8' },
+  },
+  wasm: {
+    device: 'wasm',
+    dtype: { encoder_model: 'q8', decoder_model_merged: 'q8' },
+  },
 };
+
+if (!self.crossOriginIsolated) {
+  console.warn('[worker] Sin aislamiento de origen: el decoder WASM correrá en 1 hilo (más lento). ' +
+               'Levanta la app con "python3 serve.py" en lugar de "python3 -m http.server".');
+}
 
 let transcriber = null;
 let currentDevice = null;
@@ -52,7 +68,8 @@ async function detectDevice() {
   try {
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) throw new Error('requestAdapter() devolvió null');
-    return 'webgpu';
+    if (!adapter.features.has('shader-f16')) throw new Error('la GPU no soporta shader-f16');
+    return 'gpu';
   } catch (err) {
     console.warn('[worker] WebGPU no disponible (' + err.message + ') → usando WASM (más lento).');
     return 'wasm';
@@ -68,10 +85,9 @@ function progressCallback(info) {
   }
 }
 
-async function createPipeline(modelId, device) {
+async function createPipeline(modelId, backend) {
   return pipeline('automatic-speech-recognition', modelId, {
-    device,
-    dtype: DTYPES[device],
+    ...CONFIGS[backend],
     progress_callback: progressCallback,
   });
 }
@@ -96,20 +112,23 @@ async function load(modelKey) {
     transcriber = await createPipeline(modelId, device);
   } catch (err) {
     if (isNotFound(err)) throw Object.assign(err, { code: 'MODEL_NOT_FOUND' });
-    if (device !== 'webgpu') throw err;
+    if (device !== 'gpu') throw err;
     console.warn('[worker] Falló la carga en WebGPU, reintentando en WASM:', err);
     device = 'wasm';
     transcriber = await createPipeline(modelId, device);
   }
-  currentDevice = device;
+  // Etiqueta para logs/UI: 'webgpu' = encoder en GPU + decoder en CPU
+  currentDevice = device === 'gpu' ? 'webgpu' : 'wasm';
 
   // Calentamiento: la primera ejecución compila shaders en la GPU (varios segundos)
   self.postMessage({ type: 'warming' });
   await runWhisper(new Float32Array(16000));
 
   const loadMs = Math.round(performance.now() - t0);
-  console.log(`[worker] ${modelId} listo en ${device} (${loadMs} ms)`);
-  self.postMessage({ type: 'ready', device, model: modelKey, loadMs });
+  const threads = env.backends.onnx.wasm.numThreads || (self.crossOriginIsolated ? 'auto' : 1);
+  console.log(`[worker] ${modelId} listo: ${device === 'gpu' ? 'encoder WebGPU fp16 + decoder WASM q8' : 'todo en WASM q8'}` +
+              `, hilos WASM: ${threads} (${loadMs} ms)`);
+  self.postMessage({ type: 'ready', device: currentDevice, model: modelKey, loadMs });
 }
 
 // -----------------------------------------------------------------------------

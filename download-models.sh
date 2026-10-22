@@ -4,8 +4,8 @@
 #  Después de esto la app funciona 100 % offline.
 #
 #  Uso:
-#    ./download-models.sh             # whisper-base + whisper-small (~900 MB)
-#    ./download-models.sh --solo-base # solo whisper-base (~250 MB)
+#    ./download-models.sh             # whisper-base + whisper-small (~560 MB)
+#    ./download-models.sh --solo-base # solo whisper-base (~125 MB)
 #
 #  Es re-ejecutable: los archivos ya descargados se saltan.
 # =============================================================================
@@ -32,13 +32,13 @@ CONFIG_FILES=(
   tokenizer.json tokenizer_config.json vocab.json merges.txt
   added_tokens.json normalizer.json special_tokens_map.json
 )
-# Pesos ONNX:
-#   WebGPU -> encoder fp32 + decoder q4   (configuración probada para Whisper en WebGPU)
-#   WASM   -> encoder q8   + decoder q4   (fallback)
+# Pesos ONNX (configuración más rápida medida en Safari 26 / Apple Silicon):
+#   GPU  -> encoder fp16 en WebGPU + decoder q8 en WASM multihilo
+#   WASM -> encoder q8 + decoder q8 (fallback sin WebGPU)
 ONNX_FILES=(
-  onnx/encoder_model.onnx
+  onnx/encoder_model_fp16.onnx
   onnx/encoder_model_quantized.onnx
-  onnx/decoder_model_merged_q4.onnx
+  onnx/decoder_model_merged_quantized.onnx
 )
 
 # --- utilidades --------------------------------------------------------------
@@ -89,5 +89,5 @@ done
 
 echo
 echo "Listo. Levanta la app con:"
-echo "  cd \"$ROOT\" && python3 -m http.server 8000"
-echo "y abre http://localhost:8000 en Chrome."
+echo "  cd \"$ROOT\" && python3 serve.py"
+echo "y abre http://localhost:8000 en Safari."

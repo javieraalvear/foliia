@@ -1,0 +1,4 @@
+lib/
+models/
+.env
+__pycache__/
