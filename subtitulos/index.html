@@ -1,0 +1,885 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Subtítulos en vivo</title>
+<link rel="icon" href="data:,">
+<style>
+  /* =========================================================================
+     ESTILOS BASE
+     ========================================================================= */
+  :root {
+    --cap-scale: 1;
+    --cap-size: calc(clamp(24px, 4vw, 56px) * var(--cap-scale));
+    --cap-lh: 1.3;
+    --dot-loading: #8a8a8a;
+    --dot-listening: #22c55e;
+    --dot-busy: #3b82f6;
+    --dot-error: #ef4444;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #000; color: #fff;
+    font-family: system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  }
+  body.idle { cursor: none; }
+
+  /* =========================================================================
+     VIDEO
+     ========================================================================= */
+  #cam {
+    position: fixed; inset: 0;
+    width: 100vw; height: 100vh;
+    object-fit: cover; display: block;
+    background: #000;
+  }
+  #cam.mirror { transform: scaleX(-1); }
+
+  /* =========================================================================
+     SUBTÍTULOS (rolling captions, máx. 2 líneas)
+     ========================================================================= */
+  #captions {
+    position: fixed; left: 50%; bottom: 7vh;
+    transform: translateX(-50%);
+    width: max-content; max-width: 80vw;
+    text-align: center;
+    font-size: var(--cap-size);
+    font-weight: 600;
+    line-height: var(--cap-lh);
+    pointer-events: none;
+    transition: opacity .6s ease;
+  }
+  #captions.faded { opacity: 0; }
+  #capBox {
+    /* Ventana de 2 líneas; el contenido se alinea abajo y las líneas
+       antiguas desbordan por arriba (quedan ocultas). */
+    max-height: calc(2 * var(--cap-lh) * 1em);
+    overflow: hidden;
+    display: flex; flex-direction: column; justify-content: flex-end;
+  }
+  #capInner { will-change: transform; }
+  #capText { padding: .04em .3em; }
+  .interim { opacity: .6; }
+  .final { opacity: 1; }
+
+  /* Estilo 1: caja negra */
+  .style-box #capText {
+    background: rgba(0, 0, 0, .6);
+    -webkit-box-decoration-break: clone; box-decoration-break: clone;
+    border-radius: .12em;
+  }
+  /* Estilo 2: contorno de texto */
+  .style-outline #capText {
+    -webkit-text-stroke: .14em #000;
+    paint-order: stroke fill;
+    text-shadow: 0 .04em .12em rgba(0, 0, 0, .6);
+  }
+  /* Estilo 3: editorial — bloque tipográfico grande, color plano, sin caja */
+  .style-editorial #captions {
+    text-align: left;
+    font-size: calc(var(--cap-size) * 1.3);
+    font-weight: 800;
+    letter-spacing: -.02em;
+    --cap-lh: 1.15;
+    color: #ffe14d;
+  }
+  /* Sin caja, los descendentes/contornos de la línea oculta asomarían arriba */
+  .style-outline #capBox, .style-editorial #capBox {
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 .1em);
+    mask-image: linear-gradient(to bottom, transparent 0, #000 .1em);
+  }
+  .style-editorial #capText { padding: 0; text-shadow: 0 0 .02em rgba(0, 0, 0, .35); }
+
+  /* =========================================================================
+     INDICADOR DE ESTADO (8 px)
+     ========================================================================= */
+  #status {
+    position: fixed; top: 12px; left: 12px;
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--dot-loading);
+    transition: background-color .2s;
+    z-index: 30;
+  }
+  #status[data-state="listening"] { background: var(--dot-listening); }
+  #status[data-state="busy"]      { background: var(--dot-busy); }
+  #status[data-state="error"]     { background: var(--dot-error); }
+  #status[data-state="loading"]   { background: var(--dot-loading); }
+
+  /* Barra fina superior (solo al cambiar de modelo tras iniciar) */
+  #topbar {
+    position: fixed; top: 0; left: 0; height: 2px; width: 0;
+    background: rgba(255, 255, 255, .7); z-index: 30;
+    transition: width .2s, opacity .4s; opacity: 0;
+  }
+  #topbar.on { opacity: 1; }
+
+  /* =========================================================================
+     PANTALLA INICIAL
+     ========================================================================= */
+  #start {
+    position: fixed; inset: 0; z-index: 40;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 22px;
+    background: #0b0b0b;
+  }
+  #start.hidden { display: none; }
+  #startBtn {
+    font: 600 20px/1 system-ui, sans-serif;
+    padding: 16px 44px; border-radius: 999px; border: 0;
+    background: #fff; color: #000; cursor: pointer;
+  }
+  #startBtn:disabled { opacity: .4; cursor: default; }
+  #progress { width: min(320px, 70vw); height: 4px; border-radius: 2px; background: #2a2a2a; overflow: hidden; }
+  #progressFill { height: 100%; width: 0; background: #fff; transition: width .2s; }
+  #startMsg { min-height: 1.4em; font-size: 13px; color: #9a9a9a; text-align: center; max-width: 80vw; line-height: 1.5; }
+  #startMsg.error { color: #ff8a8a; }
+
+  /* =========================================================================
+     PANEL DE CONTROLES (aparece al mover el mouse, se oculta tras 3 s)
+     ========================================================================= */
+  #panel {
+    position: fixed; top: 16px; right: 16px; z-index: 35;
+    width: 280px; padding: 14px 16px;
+    background: rgba(18, 18, 18, .82);
+    -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, .08); border-radius: 12px;
+    font-size: 12px; color: #ddd;
+    opacity: 0; pointer-events: none; transform: translateY(-6px);
+    transition: opacity .25s, transform .25s;
+  }
+  #panel.visible { opacity: 1; pointer-events: auto; transform: none; }
+  #panel label { display: block; margin: 0 0 10px; }
+  #panel .lbl { display: flex; justify-content: space-between; margin-bottom: 4px; color: #aaa; }
+  #panel select, #panel input[type=range] { width: 100%; }
+  #panel select {
+    background: #222; color: #eee; border: 1px solid #333; border-radius: 6px; padding: 5px 6px; font-size: 12px;
+  }
+  #panel .row { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+  #panel button {
+    flex: 1; background: #2a2a2a; color: #eee; border: 1px solid #3a3a3a; border-radius: 6px;
+    padding: 6px 8px; font-size: 12px; cursor: pointer;
+  }
+  #panel button.on { background: #eee; color: #111; }
+  #meter { position: relative; height: 4px; background: #2a2a2a; border-radius: 2px; overflow: hidden; margin-top: 6px; }
+  #meterFill { position: absolute; inset: 0 auto 0 0; width: 0; background: #22c55e; }
+  #meterThr { position: absolute; top: -2px; bottom: -2px; width: 2px; background: #fff; }
+  #panel .hint { color: #777; font-size: 11px; line-height: 1.5; margin-top: 4px; }
+  #panel .device { color: #777; font-size: 11px; }
+
+  /* Aviso breve de errores durante el uso */
+  #toast {
+    position: fixed; left: 16px; bottom: 16px; z-index: 36;
+    max-width: 420px; padding: 10px 14px; border-radius: 8px;
+    background: rgba(120, 20, 20, .9); color: #fff; font-size: 13px; line-height: 1.4;
+    opacity: 0; pointer-events: none; transition: opacity .3s;
+  }
+  #toast.on { opacity: 1; }
+</style>
+</head>
+<body class="style-box">
+
+<video id="cam" autoplay playsinline muted></video>
+
+<div id="captions" class="faded">
+  <div id="capBox"><div id="capInner"><span id="capText"></span></div></div>
+</div>
+
+<div id="status" data-state="loading" title="Estado"></div>
+<div id="topbar"></div>
+<div id="toast" role="alert"></div>
+
+<!-- Pantalla inicial: botón + progreso de carga del modelo -->
+<div id="start">
+  <button id="startBtn" type="button">Iniciar</button>
+  <div id="progress"><div id="progressFill"></div></div>
+  <div id="startMsg"></div>
+</div>
+
+<!-- Panel de controles -->
+<div id="panel" aria-label="Controles">
+  <label><div class="lbl">Cámara</div><select id="selCam"></select></label>
+  <label><div class="lbl">Micrófono</div><select id="selMic"></select></label>
+  <label><div class="lbl">Modelo <span class="device" id="deviceInfo"></span></div>
+    <select id="selModel">
+      <option value="base">whisper-base (rápido)</option>
+      <option value="small">whisper-small (mejor español, más lento)</option>
+    </select>
+  </label>
+  <label><div class="lbl">Estilo</div>
+    <select id="selStyle">
+      <option value="box">Caja negra</option>
+      <option value="outline">Contorno</option>
+      <option value="editorial">Editorial</option>
+    </select>
+  </label>
+  <label><div class="lbl">Tamaño de texto <span id="sizeVal"></span></div>
+    <input id="rngSize" type="range" min="0.6" max="2" step="0.1">
+  </label>
+  <label><div class="lbl">Sensibilidad VAD <span id="vadVal"></span></div>
+    <input id="rngVad" type="range" min="0" max="100" step="1">
+    <div id="meter"><div id="meterFill"></div><div id="meterThr"></div></div>
+  </label>
+  <div class="row">
+    <button id="btnMirror" type="button">Espejo</button>
+    <button id="btnPause" type="button">Pausa</button>
+  </div>
+  <div class="hint">F pantalla completa · M espejo · Espacio pausa · C limpiar · +/− tamaño · H panel</div>
+</div>
+
+<script type="module">
+// =============================================================================
+//  index.html — UI, cámara, captura de audio, VAD/segmentación y subtítulos.
+// =============================================================================
+
+const $ = (id) => document.getElementById(id);
+
+// -----------------------------------------------------------------------------
+// 1. PARÁMETROS
+// -----------------------------------------------------------------------------
+const SR = 16000;
+const FRAME_MS = 32;                 // 512 muestras a 16 kHz (ver audio-processor.js)
+const INTERIM_EVERY_MS = 1000;       // transcripción interina cada ~1 s
+const SILENCE_TO_FINAL_MS = 700;     // silencio que cierra un segmento
+const MAX_SEGMENT_MS = 15000;        // cierre forzado
+const PRE_ROLL_FRAMES = 10;          // ~320 ms de audio previo al inicio de voz
+const START_FRAMES = 2;              // frames con voz consecutivos para abrir segmento
+const MIN_VOICED_FRAMES = 4;         // segmentos con menos voz se descartan (clics, golpes)
+const KEEP_TAIL_SILENCE_FRAMES = 6;  // silencio final que se conserva al cerrar (~200 ms)
+const FADE_AFTER_MS = 4000;          // desvanecer subtítulos tras 4 s sin voz
+const PANEL_HIDE_MS = 3000;
+
+// -----------------------------------------------------------------------------
+// 2. PREFERENCIAS (localStorage, siempre envuelto en try/catch)
+// -----------------------------------------------------------------------------
+const DEFAULT_PREFS = { cameraId: '', micId: '', model: 'base', mirror: true, scale: 1, style: 'box', vad: 60 };
+const prefs = (() => {
+  try { return { ...DEFAULT_PREFS, ...JSON.parse(localStorage.getItem('subtitulos.prefs') || '{}') }; }
+  catch { return { ...DEFAULT_PREFS }; }
+})();
+function savePrefs() {
+  try { localStorage.setItem('subtitulos.prefs', JSON.stringify(prefs)); } catch { /* modo privado, etc. */ }
+}
+
+// -----------------------------------------------------------------------------
+// 3. ESTADO GLOBAL
+// -----------------------------------------------------------------------------
+const state = {
+  started: false,
+  paused: false,
+  modelReady: false,
+  device: null,
+  workerBusy: false,
+  finalQueue: [],       // los finales nunca se descartan; los interinos sí
+  nextReqId: 1,
+  error: false,
+};
+
+// -----------------------------------------------------------------------------
+// 4. INDICADOR DE ESTADO + AVISOS
+// -----------------------------------------------------------------------------
+function updateStatus() {
+  let s = 'loading';
+  if (state.error) s = 'error';
+  else if (!state.modelReady || state.paused) s = 'loading';
+  else if (state.workerBusy) s = 'busy';
+  else s = 'listening';
+  $('status').dataset.state = s;
+}
+let toastTimer;
+function toast(msg, ms = 6000) {
+  $('toast').textContent = msg;
+  $('toast').classList.add('on');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => $('toast').classList.remove('on'), ms);
+}
+function fatal(msg) {
+  console.error('[app]', msg);
+  state.error = true;
+  updateStatus();
+  if (!state.started) {
+    $('startMsg').textContent = msg;
+    $('startMsg').classList.add('error');
+  } else {
+    toast(msg, 10000);
+  }
+}
+function setProgress(p) {
+  const pct = Math.max(0, Math.min(100, p)) + '%';
+  $('progressFill').style.width = pct;
+  $('topbar').style.width = pct;
+}
+
+// -----------------------------------------------------------------------------
+// 5. WORKER (Whisper)
+// -----------------------------------------------------------------------------
+const worker = new Worker('./worker.js', { type: 'module' });
+
+worker.addEventListener('error', (e) => {
+  fatal('No se pudo iniciar el worker de transcripción: ' + (e.message || 'error desconocido') +
+        '. ¿Ejecutaste ./download-models.sh? (falta /lib/transformers.min.js)');
+});
+
+worker.addEventListener('message', (e) => {
+  const msg = e.data;
+  switch (msg.type) {
+    case 'progress':
+      setProgress(msg.progress);
+      if (!state.started) $('startMsg').textContent = `Cargando modelo… ${Math.round(msg.progress)} %`;
+      break;
+
+    case 'warming':
+      if (!state.started) $('startMsg').textContent = 'Preparando la GPU (solo tarda la primera vez)…';
+      break;
+
+    case 'ready':
+      state.modelReady = true;
+      state.device = msg.device;
+      state.error = false;
+      setProgress(100);
+      $('topbar').classList.remove('on');
+      $('deviceInfo').textContent = msg.device === 'webgpu' ? 'WebGPU' : 'WASM (sin GPU)';
+      if (!state.started) {
+        $('startMsg').classList.remove('error');
+        $('startMsg').textContent = msg.device === 'webgpu' ? '' : 'WebGPU no disponible: usando CPU (más lento).';
+      }
+      updateStatus();
+      break;
+
+    case 'result':
+      onResult(msg);
+      break;
+
+    case 'error':
+      handleWorkerError(msg);
+      break;
+  }
+});
+
+function loadModel(model) {
+  state.modelReady = false;
+  state.workerBusy = false;
+  state.finalQueue.length = 0;
+  setProgress(0);
+  if (state.started) $('topbar').classList.add('on');
+  updateStatus();
+  worker.postMessage({ type: 'load', model });
+}
+
+function handleWorkerError(msg) {
+  if (msg.code === 'MODEL_NOT_FOUND') {
+    if (prefs.model !== 'base') {
+      console.warn(`[app] whisper-${prefs.model} no está en /models; volviendo a whisper-base.`);
+      toast(`whisper-${prefs.model} no está descargado. Usando whisper-base.`);
+      prefs.model = 'base';
+      $('selModel').value = 'base';
+      savePrefs();
+      loadModel('base');
+      return;
+    }
+    fatal('Modelo no encontrado en /models. Ejecuta ./download-models.sh una vez (requiere internet) y recarga.');
+    return;
+  }
+  if (msg.id) {
+    // Error durante una inferencia: no es fatal, seguimos escuchando
+    console.error('[app] error de inferencia:', msg.message);
+    state.workerBusy = false;
+    state.error = true; updateStatus();
+    setTimeout(() => { state.error = false; updateStatus(); }, 1500);
+    pumpFinals();
+    return;
+  }
+  fatal('Error al cargar el modelo: ' + msg.message);
+}
+
+function sendToWorker(kind, segId, audio) {
+  state.workerBusy = true;
+  updateStatus();
+  worker.postMessage(
+    { type: 'transcribe', id: state.nextReqId++, segId, kind, audio },
+    [audio.buffer] // transferencia, sin copia
+  );
+}
+
+// Envía el siguiente final pendiente si el worker está libre
+function pumpFinals() {
+  if (state.workerBusy || !state.modelReady) return;
+  const f = state.finalQueue.shift();
+  if (f) sendToWorker('final', f.segId, f.audio);
+}
+
+// -----------------------------------------------------------------------------
+// 6. FILTRO ANTI-ALUCINACIONES
+// -----------------------------------------------------------------------------
+const norm = (s) => s.toLowerCase()
+  .normalize('NFD').replace(/[̀-ͯ]/g, '')
+  .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+  .replace(/\s+/g, ' ').trim();
+
+// Frases que Whisper inventa en silencio/ruido (aprendidas de subtítulos de YouTube)
+const BLACKLIST_CONTAINS = [
+  'amara org', 'comunidad de amara', 'subtitulos realizados por', 'subtitulos por la comunidad',
+  'subtitulado por', 'subtitulos creados por', 'subtitulos hechos por', 'gracias por ver',
+  'gracias por mirar', 'gracias por haber visto', 'suscribete', 'suscribanse', 'suscribirte',
+  'suscribiros', 'dale like', 'activa la campanita', 'nos vemos en el proximo video',
+  'nos vemos en el siguiente video', 'transcripcion realizada por', 'traduccion realizada por',
+  'mas videos en', 'www ',
+];
+// Frases que solo se descartan si son TODO el resultado
+const BLACKLIST_EXACT = ['musica', 'aplausos', 'risas', 'silencio', 'sonido', 'ruido', 'tos', 'suspiro'];
+// Frases legítimas pero típicas de alucinación: se descartan si hubo poca voz real
+const BLACKLIST_SOFT = ['gracias', 'muchas gracias', 'adios', 'chao', 'hola', 'gracias por su atencion', 'y', 'eh', 'mmm'];
+
+let lastFinalNorm = '';
+
+function cleanText(raw) {
+  let t = raw
+    .replace(/\[[^\]]*\]|\([^)]*\)|\*[^*]*\*|♪+|🎵+/g, ' ')  // anotaciones [Música], (risas)…
+    .replace(/\s+/g, ' ').trim();
+  // Colapsa bucles de repetición: "hola hola hola hola" → "hola"
+  t = t.replace(/(\b[\p{L}\p{N}][^.!?]{0,40}?)(?:[\s,.]+\1\b){2,}/giu, '$1');
+  return t.trim();
+}
+
+function isHallucination(text, voicedFrames) {
+  const n = norm(text);
+  if (!n) return true;
+  if (BLACKLIST_CONTAINS.some((p) => n.includes(p))) return true;
+  if (BLACKLIST_EXACT.includes(n)) return true;
+  if (BLACKLIST_SOFT.includes(n) && voicedFrames < 15) return true;  // < ~0.5 s de voz
+  if (n === lastFinalNorm) return true;                               // repetición del anterior
+  return false;
+}
+
+// -----------------------------------------------------------------------------
+// 7. SUBTÍTULOS (render con rolling captions)
+// -----------------------------------------------------------------------------
+const captions = { finals: [], interim: '', interimSeg: -1 };
+let lastActivity = 0;
+
+function renderCaptions() {
+  const inner = $('capInner');
+  const before = inner.getBoundingClientRect().height;
+
+  const textEl = $('capText');
+  textEl.replaceChildren();
+  if (captions.finals.length) {
+    const f = document.createElement('span');
+    f.className = 'final';
+    f.textContent = captions.finals.join(' ');
+    textEl.append(f);
+  }
+  if (captions.interim) {
+    const i = document.createElement('span');
+    i.className = 'interim';
+    i.textContent = (captions.finals.length ? ' ' : '') + captions.interim;
+    textEl.append(i);
+  }
+
+  // FLIP: si apareció una línea nueva, las antiguas suben suavemente
+  const after = inner.getBoundingClientRect().height;
+  const delta = after - before;
+  if (delta > 2 && before > 0) {
+    inner.style.transition = 'none';
+    inner.style.transform = `translateY(${delta}px)`;
+    void inner.offsetHeight;
+    inner.style.transition = 'transform 260ms ease-out';
+    inner.style.transform = 'translateY(0)';
+  }
+
+  const hasText = captions.finals.length || captions.interim;
+  if (hasText) {
+    $('captions').classList.remove('faded');
+    lastActivity = performance.now();
+  }
+}
+
+function pushFinal(text) {
+  captions.finals.push(text);
+  // Mantener solo lo reciente (las líneas viejas ya no son visibles)
+  while (captions.finals.join(' ').length > 400) captions.finals.shift();
+  lastFinalNorm = norm(text);
+}
+
+function clearCaptions() {
+  captions.finals = [];
+  captions.interim = '';
+  captions.interimSeg = -1;
+  lastFinalNorm = '';
+  renderCaptions();
+  $('captions').classList.add('faded');
+}
+
+// Desvanecer tras 4 s sin voz; al terminar el fade se limpia el historial
+setInterval(() => {
+  if (!state.started) return;
+  const idle = performance.now() - lastActivity > FADE_AFTER_MS;
+  if (idle && !seg.active && !state.workerBusy && !state.finalQueue.length) {
+    const c = $('captions');
+    if (!c.classList.contains('faded')) {
+      c.classList.add('faded');
+      setTimeout(() => {
+        if (c.classList.contains('faded')) {
+          captions.finals = []; captions.interim = ''; lastFinalNorm = '';
+          $('capText').replaceChildren();
+        }
+      }, 700);
+    }
+  }
+}, 250);
+
+// -----------------------------------------------------------------------------
+// 8. RESULTADOS DEL WORKER
+// -----------------------------------------------------------------------------
+function onResult(msg) {
+  state.workerBusy = false;
+  const rtf = msg.audioSec ? (msg.ms / 1000 / msg.audioSec).toFixed(2) : '–';
+  console.log(`[whisper] ${msg.kind.padEnd(7)} seg#${msg.segId} ${msg.audioSec}s audio → ${msg.ms} ms ` +
+              `(RTF ${rtf}, ${msg.device}) «${msg.text}»`);
+
+  const meta = segMeta.get(msg.segId) || { voiced: 99 };
+  const text = cleanText(msg.text);
+  const rejected = isHallucination(text, meta.voiced);
+  if (rejected && msg.text) console.log(`[filtro] descartado: «${msg.text}»`);
+
+  if (msg.kind === 'final') {
+    segMeta.delete(msg.segId);
+    if (captions.interimSeg === msg.segId) { captions.interim = ''; captions.interimSeg = -1; }
+    if (!rejected) pushFinal(text);
+    renderCaptions();
+  } else if (msg.segId === seg.id && seg.active && !rejected) {
+    // Interino solo si su segmento sigue abierto
+    captions.interim = text;
+    captions.interimSeg = msg.segId;
+    renderCaptions();
+  }
+
+  updateStatus();
+  pumpFinals();
+}
+
+// -----------------------------------------------------------------------------
+// 9. VAD + SEGMENTACIÓN (simulación de tiempo real)
+// -----------------------------------------------------------------------------
+// Umbral RMS a partir de la sensibilidad 0–100 (escala logarítmica):
+//   0 → 0.05 (solo voz fuerte)   100 → 0.002 (muy sensible)
+const vadThreshold = () => 0.05 * Math.pow(0.002 / 0.05, prefs.vad / 100);
+
+const seg = {
+  id: 0, active: false,
+  frames: [], length: 0,
+  voiced: 0, silenceMs: 0, startedAt: 0, lastInterimAt: 0,
+};
+const segMeta = new Map(); // segId -> { voiced }
+const preRoll = [];
+let voicedRun = 0;
+
+function concatFrames(frames, length) {
+  const out = new Float32Array(length);
+  let off = 0;
+  for (const f of frames) { out.set(f, off); off += f.length; }
+  return out;
+}
+
+function openSegment() {
+  seg.id++;
+  seg.active = true;
+  seg.frames = preRoll.splice(0);   // incluye el audio previo al disparo del VAD
+  seg.length = seg.frames.reduce((a, f) => a + f.length, 0);
+  seg.voiced = 0;
+  seg.silenceMs = 0;
+  seg.startedAt = performance.now();
+  seg.lastInterimAt = seg.startedAt;
+}
+
+function closeSegment(reason) {
+  seg.active = false;
+  // Recorta el silencio final, dejando un pequeño margen
+  const silentFrames = Math.floor(seg.silenceMs / FRAME_MS);
+  const drop = Math.max(0, silentFrames - KEEP_TAIL_SILENCE_FRAMES);
+  if (drop > 0) {
+    const removed = seg.frames.splice(seg.frames.length - drop, drop);
+    seg.length -= removed.reduce((a, f) => a + f.length, 0);
+  }
+  if (seg.voiced < MIN_VOICED_FRAMES || seg.length === 0) {
+    if (captions.interimSeg === seg.id) { captions.interim = ''; renderCaptions(); }
+    return;
+  }
+  segMeta.set(seg.id, { voiced: seg.voiced });
+  state.finalQueue.push({ segId: seg.id, audio: concatFrames(seg.frames, seg.length), reason });
+  seg.frames = []; seg.length = 0;
+  pumpFinals();
+}
+
+function onAudioFrame(samples, rms) {
+  updateMeter(rms);
+  if (state.paused || !state.modelReady) return;
+
+  const voiced = rms > vadThreshold();
+  if (voiced) lastActivity = performance.now();
+
+  if (!seg.active) {
+    // Inactivo: mantener un pre-roll y esperar voz sostenida
+    preRoll.push(samples);
+    if (preRoll.length > PRE_ROLL_FRAMES) preRoll.shift();
+    voicedRun = voiced ? voicedRun + 1 : 0;
+    if (voicedRun >= START_FRAMES) {
+      openSegment();
+      seg.voiced = voicedRun;
+      voicedRun = 0;
+    }
+    return;
+  }
+
+  // Segmento abierto: acumular
+  seg.frames.push(samples);
+  seg.length += samples.length;
+  if (voiced) { seg.voiced++; seg.silenceMs = 0; } else { seg.silenceMs += FRAME_MS; }
+
+  const now = performance.now();
+  const durMs = (seg.length / SR) * 1000;
+
+  if (seg.silenceMs >= SILENCE_TO_FINAL_MS) { closeSegment('silencio'); return; }
+  if (durMs >= MAX_SEGMENT_MS) {
+    console.log('[vad] segmento > 15 s: cierre forzado');
+    closeSegment('forzado');
+    if (voiced) openSegment();   // la persona sigue hablando
+    return;
+  }
+
+  // Interino cada ~1 s, solo si el worker está libre (nunca se encola)
+  if (now - seg.lastInterimAt >= INTERIM_EVERY_MS && seg.voiced >= MIN_VOICED_FRAMES) {
+    seg.lastInterimAt = now;
+    if (!state.workerBusy && !state.finalQueue.length) {
+      sendToWorker('interim', seg.id, concatFrames(seg.frames, seg.length));
+    }
+  }
+}
+
+// Medidor de nivel en el panel (para ajustar la sensibilidad)
+let meterRaf = 0, meterRms = 0;
+function updateMeter(rms) {
+  meterRms = rms;
+  if (meterRaf || !$('panel').classList.contains('visible')) return;
+  meterRaf = requestAnimationFrame(() => {
+    meterRaf = 0;
+    const toPct = (v) => Math.min(100, Math.max(0, (Math.log10(v + 1e-5) + 3.5) / 3 * 100)); // log −3.5…−0.5
+    $('meterFill').style.width = toPct(meterRms) + '%';
+    $('meterFill').style.background = meterRms > vadThreshold() ? '#22c55e' : '#555';
+    $('meterThr').style.left = toPct(vadThreshold()) + '%';
+  });
+}
+
+// -----------------------------------------------------------------------------
+// 10. CÁMARA Y MICRÓFONO
+// -----------------------------------------------------------------------------
+let videoStream = null, audioStream = null;
+let audioCtx = null, workletNode = null, sourceNode = null;
+
+function mediaErrorMessage(err, what) {
+  switch (err?.name) {
+    case 'NotAllowedError':
+    case 'SecurityError':
+      return `Permiso de ${what} denegado. Actívalo en el icono junto a la URL y recarga la página.`;
+    case 'NotFoundError':
+    case 'OverconstrainedError':
+      return `No se encontró ningún dispositivo de ${what}.`;
+    case 'NotReadableError':
+      return `El ${what} está en uso por otra aplicación.`;
+    default:
+      return `Error al acceder a ${what}: ${err?.message || err}`;
+  }
+}
+
+async function startCamera(deviceId) {
+  videoStream?.getTracks().forEach((t) => t.stop());
+  const video = deviceId
+    ? { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+    : { width: { ideal: 1920 }, height: { ideal: 1080 } };
+  try {
+    videoStream = await navigator.mediaDevices.getUserMedia({ video });
+  } catch (err) {
+    if (deviceId && err.name === 'OverconstrainedError') return startCamera('');  // cámara guardada ya no existe
+    throw Object.assign(err, { what: 'cámara' });
+  }
+  $('cam').srcObject = videoStream;
+}
+
+async function startMic(deviceId) {
+  audioStream?.getTracks().forEach((t) => t.stop());
+  const audio = { echoCancellation: true, noiseSuppression: true, channelCount: 1 };
+  if (deviceId) audio.deviceId = { exact: deviceId };
+  try {
+    audioStream = await navigator.mediaDevices.getUserMedia({ audio });
+  } catch (err) {
+    if (deviceId && err.name === 'OverconstrainedError') return startMic('');
+    throw Object.assign(err, { what: 'micrófono' });
+  }
+
+  if (!audioCtx) {
+    audioCtx = new AudioContext({ latencyHint: 'interactive' });
+    await audioCtx.audioWorklet.addModule('./audio-processor.js');
+    workletNode = new AudioWorkletNode(audioCtx, 'resampler-processor', {
+      numberOfInputs: 1, numberOfOutputs: 1, channelCount: 1, channelCountMode: 'explicit',
+    });
+    workletNode.port.onmessage = (e) => onAudioFrame(e.data.samples, e.data.rms);
+    // Salida silenciada: mantiene el grafo "vivo" sin reproducir el micrófono
+    const mute = audioCtx.createGain();
+    mute.gain.value = 0;
+    workletNode.connect(mute).connect(audioCtx.destination);
+  }
+  sourceNode?.disconnect();
+  sourceNode = audioCtx.createMediaStreamSource(audioStream);
+  sourceNode.connect(workletNode);
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+}
+
+async function populateDevices() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const fill = (sel, kind, currentId) => {
+    sel.replaceChildren();
+    devices.filter((d) => d.kind === kind).forEach((d, i) => {
+      const o = document.createElement('option');
+      o.value = d.deviceId;
+      o.textContent = d.label || `${kind === 'videoinput' ? 'Cámara' : 'Micrófono'} ${i + 1}`;
+      sel.append(o);
+    });
+    if (currentId) sel.value = currentId;
+  };
+  fill($('selCam'), 'videoinput', videoStream?.getVideoTracks()[0]?.getSettings().deviceId);
+  fill($('selMic'), 'audioinput', audioStream?.getAudioTracks()[0]?.getSettings().deviceId);
+}
+
+// -----------------------------------------------------------------------------
+// 11. PANEL DE CONTROLES
+// -----------------------------------------------------------------------------
+let panelTimer, panelPinned = false;
+function showPanel() {
+  if (!state.started) return;
+  $('panel').classList.add('visible');
+  document.body.classList.remove('idle');
+  clearTimeout(panelTimer);
+  if (!panelPinned) panelTimer = setTimeout(hidePanel, PANEL_HIDE_MS);
+}
+function hidePanel() {
+  // No ocultar mientras el mouse está encima o un control tiene el foco
+  if (!panelPinned && ($('panel').matches(':hover') || $('panel').contains(document.activeElement))) {
+    panelTimer = setTimeout(hidePanel, PANEL_HIDE_MS);
+    return;
+  }
+  $('panel').classList.remove('visible');
+  document.body.classList.add('idle');
+}
+document.addEventListener('mousemove', showPanel);
+
+function applyPrefs() {
+  $('cam').classList.toggle('mirror', prefs.mirror);
+  $('btnMirror').classList.toggle('on', prefs.mirror);
+  document.documentElement.style.setProperty('--cap-scale', prefs.scale);
+  document.body.classList.remove('style-box', 'style-outline', 'style-editorial');
+  document.body.classList.add('style-' + prefs.style);
+  $('selStyle').value = prefs.style;
+  $('selModel').value = prefs.model;
+  $('rngSize').value = prefs.scale;
+  $('sizeVal').textContent = Math.round(prefs.scale * 100) + ' %';
+  $('rngVad').value = prefs.vad;
+  $('vadVal').textContent = prefs.vad;
+  $('btnPause').classList.toggle('on', state.paused);
+  $('btnPause').textContent = state.paused ? 'Reanudar' : 'Pausa';
+}
+
+function toggleMirror() { prefs.mirror = !prefs.mirror; savePrefs(); applyPrefs(); }
+function setScale(v) { prefs.scale = Math.round(Math.min(2, Math.max(0.6, v)) * 10) / 10; savePrefs(); applyPrefs(); }
+function togglePause() {
+  state.paused = !state.paused;
+  if (state.paused) {
+    // Abandonar el segmento en curso sin transcribir
+    seg.active = false; seg.frames = []; seg.length = 0; preRoll.length = 0;
+    captions.interim = ''; renderCaptions();
+  }
+  applyPrefs();
+  updateStatus();
+}
+
+$('selCam').addEventListener('change', async (e) => {
+  try { await startCamera(e.target.value); prefs.cameraId = e.target.value; savePrefs(); }
+  catch (err) { toast(mediaErrorMessage(err, 'cámara')); }
+});
+$('selMic').addEventListener('change', async (e) => {
+  try { await startMic(e.target.value); prefs.micId = e.target.value; savePrefs(); }
+  catch (err) { toast(mediaErrorMessage(err, 'micrófono')); }
+});
+$('selModel').addEventListener('change', (e) => { prefs.model = e.target.value; savePrefs(); loadModel(prefs.model); });
+$('selStyle').addEventListener('change', (e) => { prefs.style = e.target.value; savePrefs(); applyPrefs(); });
+$('rngSize').addEventListener('input', (e) => setScale(+e.target.value));
+$('rngVad').addEventListener('input', (e) => { prefs.vad = +e.target.value; savePrefs(); applyPrefs(); });
+$('btnMirror').addEventListener('click', toggleMirror);
+$('btnPause').addEventListener('click', togglePause);
+navigator.mediaDevices?.addEventListener?.('devicechange', () => state.started && populateDevices());
+
+// -----------------------------------------------------------------------------
+// 12. ATAJOS DE TECLADO
+// -----------------------------------------------------------------------------
+document.addEventListener('keydown', (e) => {
+  if (!state.started || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.target.tagName === 'SELECT') return;  // no interferir con los selectores
+  const k = e.key;
+  const handled = () => { e.preventDefault(); e.target.blur?.(); };
+  if (k === 'f' || k === 'F') {
+    handled();
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen().catch(() => {});
+  } else if (k === 'm' || k === 'M') { handled(); toggleMirror(); }
+  else if (k === ' ') { handled(); togglePause(); }
+  else if (k === 'c' || k === 'C') { handled(); clearCaptions(); }
+  else if (k === '+' || k === '=') { handled(); setScale(prefs.scale + 0.1); }
+  else if (k === '-' || k === '_') { handled(); setScale(prefs.scale - 0.1); }
+  else if (k === 'h' || k === 'H') {
+    handled();
+    panelPinned = !panelPinned;
+    if (panelPinned) showPanel(); else { clearTimeout(panelTimer); hidePanel(); }
+  }
+});
+
+// -----------------------------------------------------------------------------
+// 13. ARRANQUE
+// -----------------------------------------------------------------------------
+async function start() {
+  $('startBtn').disabled = true;
+  try {
+    await startCamera(prefs.cameraId);
+    await startMic(prefs.micId);
+  } catch (err) {
+    $('startBtn').disabled = false;
+    fatal(mediaErrorMessage(err, err.what || 'cámara/micrófono'));
+    return;
+  }
+  await populateDevices();
+  state.started = true;
+  $('start').classList.add('hidden');
+  document.body.classList.add('idle');
+  if (!state.modelReady && !state.error) $('topbar').classList.add('on');  // el modelo aún carga
+  updateStatus();
+}
+
+// Comprobaciones de entorno
+(function boot() {
+  applyPrefs();
+  if (location.protocol === 'file:') {
+    fatal('Abre la app desde un servidor local: python3 -m http.server 8000 → http://localhost:8000');
+    $('startBtn').disabled = true;
+    return;
+  }
+  if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+    fatal('La cámara/micrófono requieren http://localhost o https. Abre http://localhost:8000');
+    $('startBtn').disabled = true;
+    return;
+  }
+  if (!('gpu' in navigator)) console.warn('[app] WebGPU no disponible: la transcripción usará WASM (más lenta).');
+  $('startMsg').textContent = 'Cargando modelo…';
+  loadModel(prefs.model);  // la carga empieza ya; "Iniciar" puede pulsarse en paralelo
+  $('startBtn').addEventListener('click', start);
+})();
+</script>
+</body>
+</html>
